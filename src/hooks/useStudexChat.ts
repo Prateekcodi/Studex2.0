@@ -134,6 +134,10 @@ export const useStudexChat = () => {
     const userId = user.id; // user.id from Supabase auth is the supabaseId
     console.log('[Chat] Connecting socket for user:', { authId: user.id, name: user.name });
 
+    // Skip MongoDB sync for demo users (they don't have real Supabase IDs)
+    const isDemoUser = userId.startsWith('demo-');
+    let joinCompleted = false;
+
     const socket = socketService.connect();
 
     const handleConnect = () => {
@@ -151,11 +155,14 @@ export const useStudexChat = () => {
     // Join with user info from Supabase auth
     const joinTimeout = setTimeout(() => {
       console.warn('[Chat] join() timed out — proceeding anyway');
+      joinCompleted = true;
       // Don't block on join — socket is connected, channel messages work anyway
     }, 5000);
 
     socketService.join(userId, deviceId.current)
       .then(async (res) => {
+        if (joinCompleted) return; // Prevent double execution
+        joinCompleted = true;
         clearTimeout(joinTimeout);
         console.log('[Chat] join() success:', {
           user: res.user?.name,
@@ -168,28 +175,36 @@ export const useStudexChat = () => {
         setFriends(res.friends || []);
         setChannels(res.channels || []);
 
-        // Sync user data to MongoDB via REST
-        await socketService.upsertUser({
-          supabaseId: userId,
-          name: user.name,
-          username: user.username || user.email?.split('@')[0] || `user_${user.id?.slice(0, 8)}`,
-          email: user.email,
-          college: user.college,
-          branch: user.branch,
-          year: user.year,
-          bio: user.bio,
-          avatar: user.avatar,
-          isVerified: user.isVerified,
-          accessLevel: user.accessLevel,
-        });
+        // Sync user data to MongoDB via REST (skip for demo users)
+        if (!isDemoUser) {
+          await socketService.upsertUser({
+            supabaseId: userId,
+            name: user.name,
+            username: user.username || user.email?.split('@')[0] || `user_${user.id?.slice(0, 8)}`,
+            email: user.email,
+            college: user.college,
+            branch: user.branch,
+            year: user.year,
+            bio: user.bio,
+            avatar: user.avatar,
+            isVerified: user.isVerified,
+            accessLevel: user.accessLevel,
+          }).catch(err => console.warn('[Chat] upsertUser warning (non-fatal):', err.message));
+        } else {
+          console.log('[Chat] Skipping MongoDB sync for demo user');
+        }
       })
       .catch((err) => {
+        if (joinCompleted) return;
+        joinCompleted = true;
         clearTimeout(joinTimeout);
         console.error('[Chat] join() failed:', err.message);
         // Even if join fails — socket is connected, can still send/receive messages
       });
 
     return () => {
+      clearTimeout(joinTimeout);
+      joinCompleted = true;
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
     };
@@ -401,7 +416,7 @@ export const useStudexChat = () => {
       await socketService.sendDM({ supabaseId, recipientId, text: trimmed, type, imageUrl, replyTo });
       socketService.stopTyping(supabaseId, recipientId);
     }
-  }, [activeView, supabaseId]);
+  }, [activeView, user?.id]);
 
   const loadHistory = useCallback(async (partnerId: string, page: number = 1) => {
     if (!supabaseId) return;
@@ -428,23 +443,23 @@ export const useStudexChat = () => {
     } finally {
       setLoading(false);
     }
-  }, [supabaseId]);
+  }, [user?.id]);
 
   const markRead = useCallback(async (partnerId: string, messageIds?: string[]) => {
     socketService.markSeen(supabaseId, partnerId, messageIds);
-  }, [supabaseId]);
+  }, [user?.id]);
 
   const reactToMessage = useCallback(async (messageId: string, emoji: string, action: 'add' | 'remove' = 'add') => {
     await socketService.react(supabaseId, messageId, emoji, action);
-  }, [supabaseId]);
+  }, [user?.id]);
 
   const deleteMessage = useCallback(async (messageId: string) => {
     await socketService.deleteMessage(supabaseId, messageId);
-  }, [supabaseId]);
+  }, [user?.id]);
 
   const sendTypingIndicator = useCallback((recipientId: string, username: string) => {
     socketService.sendTyping(supabaseId, recipientId, username);
-  }, [supabaseId]);
+  }, [user?.id]);
 
   const startOrSelectConversation = useCallback(async (partner: StudexUser) => {
     let existing = conversations.find(c =>
@@ -480,22 +495,22 @@ export const useStudexChat = () => {
     setActiveConversation(existing);
     await loadHistory(existing._id);
     await markRead(existing._id);
-  }, [conversations, supabaseId, loadHistory, markRead]);
+  }, [conversations, user?.id, loadHistory, markRead]);
 
   const sendFriendRequestFn = useCallback(async (recipientId: string) => {
     const username = currentUser?.username || 'User';
     const avatar = currentUser?.avatar || '';
     await socketService.sendFriendRequest(supabaseId, recipientId, username, avatar);
-  }, [supabaseId, currentUser]);
+  }, [user?.id, currentUser]);
 
   const acceptFriendRequest = useCallback(async (requesterId: string, requesterObj?: any) => {
     await socketService.acceptFriend(supabaseId, requesterId, requesterObj);
-  }, [supabaseId]);
+  }, [user?.id]);
 
   const rejectFriendRequest = useCallback(async (requesterId: string) => {
     await socketService.rejectFriend(supabaseId, requesterId);
     setFriendRequests(prev => prev.filter(r => r._id !== requesterId));
-  }, [supabaseId]);
+  }, [user?.id]);
 
   const unfriend = useCallback(async (friendId: string) => {
     await socketService.unfriend(supabaseId, friendId);
@@ -505,11 +520,11 @@ export const useStudexChat = () => {
     )) {
       setActiveConversation(null);
     }
-  }, [supabaseId, activeConversation]);
+  }, [user?.id, activeConversation]);
 
   const refreshConversations = useCallback(async () => {
     await socketService.refreshConversations(supabaseId);
-  }, [supabaseId]);
+  }, [user?.id]);
 
   // ── Channel Actions ─────────────────────────────────────
 
@@ -542,14 +557,14 @@ export const useStudexChat = () => {
     } finally {
       setLoading(false);
     }
-  }, [activeView, supabaseId]);
+  }, [activeView, user?.id]);
 
   const sendChannelMessage = useCallback(async (text: string, type: string = 'text', imageUrl?: string, replyTo?: any) => {
     if (!activeView || activeView.type !== 'channel') return;
     const { channel } = activeView;
     await socketService.sendChannelMessage({ supabaseId, channelId: channel._id, text: text.trim(), type, imageUrl, replyTo });
     socketService.stopChannelTyping(supabaseId, channel._id);
-  }, [activeView, supabaseId]);
+  }, [activeView, user?.id]);
 
   const sendChannelTyping = useCallback((username: string) => {
     if (!activeView || activeView.type !== 'channel') return;
@@ -560,11 +575,11 @@ export const useStudexChat = () => {
       isTypingRef.current = false;
       socketService.stopChannelTyping(supabaseId, activeView.channel._id);
     }, 2000);
-  }, [activeView, supabaseId]);
+  }, [activeView, user?.id]);
 
   const reactToChannelMessage = useCallback(async (messageId: string, emoji: string, action: 'add' | 'remove' = 'add') => {
     await socketService.reactChannelMessage(supabaseId, messageId, emoji, action);
-  }, [supabaseId]);
+  }, [user?.id]);
 
   const loadMoreChannelHistory = useCallback(async (channelId: string, page: number) => {
     try {
@@ -583,7 +598,7 @@ export const useStudexChat = () => {
   const createChannel = useCallback(async (name: string, description?: string, isPrivate?: boolean) => {
     const result = await socketService.createChannelREST({ name, description, isPrivate, createdBy: supabaseId });
     return result;
-  }, [supabaseId]);
+  }, [user?.id]);
 
   /** Manually add a channel to the sidebar list (used when REST creates it but socket event hasn't arrived yet) */
   const addChannelToList = useCallback((channel: StudexChannel) => {
@@ -595,14 +610,14 @@ export const useStudexChat = () => {
 
   const joinChannelById = useCallback(async (channelId: string) => {
     return socketService.joinChannelREST(channelId, supabaseId);
-  }, [supabaseId]);
+  }, [user?.id]);
 
   const leaveChannelView = useCallback(() => {
     if (activeView?.type === 'channel') {
       socketService.leaveChannel(supabaseId, activeView.channel._id);
     }
     setActiveView(null);
-  }, [activeView, supabaseId]);
+  }, [activeView, user?.id]);
 
   return {
     // ── Core ────────────────────────────────────────────

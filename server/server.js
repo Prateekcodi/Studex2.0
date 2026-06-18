@@ -226,7 +226,7 @@ app.post('/api/users/upsert', async (req, res) => {
 
     let user = await User.findOne({ supabaseId });
     if (user) {
-      // Update fields if provided
+      // User already exists - update fields if provided
       Object.assign(user, {
         ...(name && { name }),
         ...(username && { username }),
@@ -239,23 +239,30 @@ app.post('/api/users/upsert', async (req, res) => {
         ...(accessLevel && { accessLevel }),
       });
       await user.save();
-    } else {
-      user = await User.create({
-        supabaseId, name, username, email, college, branch, year,
-        bio: bio || '', avatar: avatar || '', isVerified: isVerified || false,
-        accessLevel: accessLevel || 'full',
-      });
+      return res.json({ user });
     }
+
+    // Create new user
+    user = await User.create({
+      supabaseId, name, username, email, college, branch, year,
+      bio: bio || '', avatar: avatar || '', isVerified: isVerified || false,
+      accessLevel: accessLevel || 'full',
+    });
     res.json({ user });
   } catch (err) {
+    console.error('Upsert error:', err.code, err.message);
     if (err.code === 11000) {
-      // Duplicate username - append a number
-      const rawUsername = req.body.username || 'user';
-      const rand = Math.floor(Math.random() * 9000) + 1000;
-      req.body.username = `${rawUsername}${rand}`;
-      // Retry
-      const user = await User.create(req.body);
-      return res.json({ user });
+      // Duplicate key error - user was created by another request, just fetch and return it
+      const existingUser = await User.findOne({ supabaseId: req.body.supabaseId });
+      if (existingUser) {
+        return res.json({ user: existingUser });
+      }
+      // If still not found, try finding by email (fallback)
+      const byEmail = await User.findOne({ email: req.body.email });
+      if (byEmail) {
+        return res.json({ user: byEmail });
+      }
+      return res.status(409).json({ error: 'User already exists but could not be retrieved' });
     }
     res.status(500).json({ error: err.message });
   }
@@ -576,7 +583,20 @@ io.on('connection', async (socket) => {
       // Get or create user
       let user = await getUser(supabaseId);
       if (!user) {
-        user = await User.create({ supabaseId, name: 'User', username: `user_${supabaseId.slice(0, 8)}`, email: `${supabaseId}@placeholder.com`, college: 'Unknown', branch: 'Unknown', year: 1 });
+        try {
+          user = await User.create({ supabaseId, name: 'User', username: `user_${supabaseId.slice(0, 8)}`, email: `${supabaseId}@placeholder.com`, college: 'Unknown', branch: 'Unknown', year: 1 });
+        } catch (createErr) {
+          if (createErr.code === 11000) {
+            // User was just created by another request - fetch it
+            user = await getUser(supabaseId);
+          } else {
+            throw createErr;
+          }
+        }
+        if (!user) {
+          if (callback) callback({ status: 'error', message: 'Failed to get or create user' });
+          return;
+        }
       }
 
       // Join a private room for this user
