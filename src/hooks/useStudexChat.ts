@@ -93,6 +93,8 @@ export type ActiveView =
 
 export const useStudexChat = () => {
   const { user } = useAuth();
+  // supabaseId is the Supabase auth user ID - user.id is exactly what we need
+  const supabaseId = user?.id || '';
   const [connected, setConnected] = useState(false);
   const [currentUser, setCurrentUser] = useState<StudexUser | null>(null);
   const [conversations, setConversations] = useState<StudexConversation[]>([]);
@@ -116,7 +118,6 @@ export const useStudexChat = () => {
   const isTypingRef = useRef(false);
   const channelTypingTimeouts = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
-  const supabaseId = user?.id || '';
   const deviceId = useRef(localStorage.getItem('studex_device_id') || (() => {
     const id = `device_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     localStorage.setItem('studex_device_id', id);
@@ -125,19 +126,43 @@ export const useStudexChat = () => {
 
   // ── Socket Connect & Join ────────────────────────────────
   useEffect(() => {
-    if (!user?.id || !user?.supabaseId) return;
+    if (!user?.id) {
+      console.log('[Chat] Waiting for user...');
+      return;
+    }
+
+    const userId = user.id; // user.id from Supabase auth is the supabaseId
+    console.log('[Chat] Connecting socket for user:', { authId: user.id, name: user.name });
 
     const socket = socketService.connect();
 
-    const handleConnect = () => setConnected(true);
-    const handleDisconnect = () => setConnected(false);
+    const handleConnect = () => {
+      console.log('[Socket] Connected!');
+      setConnected(true);
+    };
+    const handleDisconnect = () => {
+      console.log('[Socket] Disconnected');
+      setConnected(false);
+    };
 
     socket.on('connect', handleConnect);
     socket.on('disconnect', handleDisconnect);
 
     // Join with user info from Supabase auth
-    socketService.join(user.supabaseId, deviceId.current)
+    const joinTimeout = setTimeout(() => {
+      console.warn('[Chat] join() timed out — proceeding anyway');
+      // Don't block on join — socket is connected, channel messages work anyway
+    }, 5000);
+
+    socketService.join(userId, deviceId.current)
       .then(async (res) => {
+        clearTimeout(joinTimeout);
+        console.log('[Chat] join() success:', {
+          user: res.user?.name,
+          convCount: res.conversations?.length,
+          channelCount: res.channels?.length,
+        });
+
         setCurrentUser(res.user);
         setConversations(res.conversations || []);
         setFriends(res.friends || []);
@@ -145,7 +170,7 @@ export const useStudexChat = () => {
 
         // Sync user data to MongoDB via REST
         await socketService.upsertUser({
-          supabaseId: user.supabaseId || user.id,
+          supabaseId: userId,
           name: user.name,
           username: user.username || user.email?.split('@')[0] || `user_${user.id?.slice(0, 8)}`,
           email: user.email,
@@ -158,7 +183,11 @@ export const useStudexChat = () => {
           accessLevel: user.accessLevel,
         });
       })
-      .catch(console.error);
+      .catch((err) => {
+        clearTimeout(joinTimeout);
+        console.error('[Chat] join() failed:', err.message);
+        // Even if join fails — socket is connected, can still send/receive messages
+      });
 
     return () => {
       socket.off('connect', handleConnect);
@@ -353,7 +382,7 @@ export const useStudexChat = () => {
     return () => {
       [offNew, offConfirm, offSeen, offReact, offDelete, offTyping, offTypingStop, offOnline, offConvUpdate, offFriendRequest, offFriendAccepted, offFriendRejected, offFriendUnfriended, offChannelCreated, offChannelDeleted, offChannelMsg, offChannelTyping, offChannelTypingStop, offChannelReact].forEach(off => off());
     };
-  }, [supabaseId]);
+  }, [user?.id]);
 
   // ── Actions ──────────────────────────────────────────────
 
